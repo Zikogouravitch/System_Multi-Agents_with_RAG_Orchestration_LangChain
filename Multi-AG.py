@@ -27,12 +27,15 @@ from llama_index.llms.ollama import Ollama
 # CONFIG
 # ==========================================================
 
-MODEL_NAME      = "gemma3:4b"
+MODEL_NAME      = "gemma3:1b"
 DATA_FILE       = "medicaments.jsonl"
 EMBEDDING_DIR   = "./pharma_embedding_cache"
 INDEX_DIR       = "./pharma_index_cache"
 MODEL_EMBEDDING = "sentence-transformers/all-MiniLM-L6-v2"
 
+# ==========================================================
+# DICTIONNAIRES METIER
+# ==========================================================
 
 SYMPTOM_MAP = {
     "fievre":          ["PARACETAMOL", "IBUPROFENE"],
@@ -52,6 +55,10 @@ SYMPTOM_MAP = {
 BANNED_TERMS  = ["INJECTABLE", "VACCIN", "PERFUSION"]
 SALUTATIONS   = {"hello","bonjour","bonsoir","salut","hi","hey","bonne nuit","salam","slt","bjr"}
 REMERCIEMENTS = {"merci","thanks","thank you","super","parfait","nickel","ok","d accord"}
+
+# ==========================================================
+# UTILS
+# ==========================================================
 
 def normalize_text(text: str) -> str:
     text = text.lower()
@@ -110,13 +117,11 @@ else:
     print("Premier démarrage - construction de l'index RAG (une seule fois)...")
     documents = []
     for med in data:
-        
         documents.append(Document(
             text=format_med(med),
             metadata={"source": "jsonl", "drug_name": med.get("drug_name", "")}
         ))
         if med.get("indications"):
-            
             documents.append(Document(
                 text=f"Medicament {med['drug_name']} indique pour : {', '.join(med['indications'])}",
                 metadata={"source": "jsonl_indications", "drug_name": med.get("drug_name", "")}
@@ -127,6 +132,7 @@ else:
 
 rag_query_engine = index.as_query_engine(similarity_top_k=3, response_mode="compact")
 
+# LLM LangChain partagé
 llm = OllamaLLM(model=MODEL_NAME, timeout=120)
 
 # ==========================================================
@@ -134,7 +140,7 @@ llm = OllamaLLM(model=MODEL_NAME, timeout=120)
 # ==========================================================
 
 def detect_intent(query: str) -> str:
-    q= normalize_text(query)
+    q      = normalize_text(query)
     tokens = set(q.split())
     if len(q) < 3:
         return "trop_court"
@@ -146,9 +152,10 @@ def detect_intent(query: str) -> str:
         if fuzz.token_set_ratio(q, normalize_text(symptom)) >= 80:
             return "symptome"
     for med in data:
-        name  = normalize_text(med["drug_name"])
-        score = max(fuzz.partial_ratio(q, name), fuzz.token_set_ratio(q, name))
-        if score >= 82:
+        name = normalize_text(med["drug_name"])
+        scores = [fuzz.partial_ratio(q, name), fuzz.token_set_ratio(q, name)]
+        scores += [fuzz.partial_ratio(token, name) for token in tokens]
+        if max(scores) >= 82:
             return "medicament"
     return "inconnu"
 
@@ -348,6 +355,12 @@ def agent_writer(question: str, symptom: str, context: str, safety: str) -> str:
 # ==========================================================
 
 def orchestrator(query: str) -> str:
+    """
+    Orchestrateur principal :
+    1. Détecte l'intention → routage conditionnel
+    2. Pipeline séquentiel : Agent1 → Agent2 → Agent3 → Agent4
+    3. L'état est transmis via des variables locales entre étapes
+    """
     intent = detect_intent(query)
 
     if intent == "trop_court":
@@ -375,7 +388,7 @@ def orchestrator(query: str) -> str:
         result1 = create_agent_symptomes().invoke({"input": query})
         symptom = result1.get("output", "")
     except Exception as e:
-        print(f"Agent 1 erreur : {e}")
+        print(f" Agent 1 erreur : {e}")
 
     print("\nAgent 2 : recherche RAG...")
     context = ""
@@ -384,7 +397,7 @@ def orchestrator(query: str) -> str:
         result2   = create_agent_rag().invoke({"input": rag_input})
         context   = result2.get("output", "")
     except Exception as e:
-        print(f"   Agent 2 erreur : {e}")
+        print(f"Agent 2 erreur : {e}")
 
     if not symptom and not context:
         return (
@@ -400,19 +413,19 @@ def orchestrator(query: str) -> str:
     except Exception as e:
         print(f"Agent 3 erreur : {e}")
 
-    print("\n Agent 4 : rédaction finale...")
+    print("\nAgent 4 : rédaction finale...")
     response = agent_writer(query, symptom, context, safety)
     print("Réponse rédigée.")
 
     return response
 
 # ==========================================================
-# main
+# TERMINAL
 # ==========================================================
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("   PharmaGuardian AI - Assistant Pharmaceutique Intelligent")
+    print("   PharmaGuardian AI - Assistant Pharmaceutique Professionnel")
     print("   Tapez 'exit' pour quitter")
     print("=" * 60)
 
