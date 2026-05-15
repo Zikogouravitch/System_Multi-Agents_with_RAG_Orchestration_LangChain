@@ -3,10 +3,11 @@ import json
 import re
 import unicodedata
 import warnings
+import numpy as np
 warnings.filterwarnings("ignore")
 
 from rapidfuzz import fuzz
-
+from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 
 # ── LangChain ──────────────────────────────────────────────
@@ -27,30 +28,18 @@ from llama_index.llms.ollama import Ollama
 # CONFIG
 # ==========================================================
 
-MODEL_NAME      = "gemma3:1b"
-DATA_FILE       = "medicaments.jsonl"
+MODEL_NAME      = "gemma3:4b"
+DATA_FILE = "dataset/medicaments.jsonl"
 EMBEDDING_DIR   = "./pharma_embedding_cache"
 INDEX_DIR       = "./pharma_index_cache"
-MODEL_EMBEDDING = "sentence-transformers/all-MiniLM-L6-v2"
+
+MODEL_EMBEDDING = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+SIMILARITY_THRESHOLD = 0.45
 
 # ==========================================================
-# DICTIONNAIRES METIER
+# CONSTANTES METIER
 # ==========================================================
-
-SYMPTOM_MAP = {
-    "fievre":          ["PARACETAMOL", "IBUPROFENE"],
-    "toux seche":      ["DEXTROMETHORPHANE"],
-    "toux grasse":     ["AMBROXOL"],
-    "allergie":        ["CETIRIZINE"],
-    "douleur":         ["PARACETAMOL", "IBUPROFENE"],
-    "reflux":          ["OMEPRAZOLE"],
-    "mal de tete":     ["PARACETAMOL", "IBUPROFENE"],
-    "rhume":           ["PARACETAMOL", "PSEUDOEPHEDRINE"],
-    "inflammation":    ["IBUPROFENE"],
-    "brulure estomac": ["OMEPRAZOLE"],
-    "nausee":          ["DOMPERIDONE"],
-    "infection":       ["AMOXICILLINE"],
-}
 
 BANNED_TERMS  = ["INJECTABLE", "VACCIN", "PERFUSION"]
 SALUTATIONS   = {"hello","bonjour","bonsoir","salut","hi","hey","bonne nuit","salam","slt","bjr"}
@@ -67,47 +56,59 @@ def normalize_text(text: str) -> str:
     text = re.sub(r"[^a-z0-9\s]", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
-def load_data():
+def load_data() -> list:
     data = []
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         for line in f:
-            data.append(json.loads(line))
+            line = line.strip()
+            if line:
+                data.append(json.loads(line))
     return data
 
 def format_med(m: dict) -> str:
     return (
-        f"Nom: {m.get('drug_name','Non disponible')}\n"
-        f"Presentation: {m.get('presentation','Non disponible')}\n"
-        f"Fabricant: {m.get('manufacturer','Non disponible')}\n"
-        f"Dosage: {m.get('dosage',{})}\n"
-        f"Composition: {', '.join(m.get('composition',[]))}\n"
-        f"Classe therapeutique: {m.get('therapeutic_class','Non disponible')}\n"
-        f"Statut: {m.get('status','Non disponible')}\n"
-        f"Prix: {m.get('price',{}).get('ppv','N/A')} MAD\n"
-        f"Indications: {', '.join(m.get('indications',[])) if m.get('indications') else 'Non specifie'}"
+        f"Nom: {m.get('drug_name', 'Non disponible')}\n"
+        f"Presentation: {m.get('presentation', 'Non disponible')}\n"
+        f"Fabricant: {m.get('manufacturer', 'Non disponible')}\n"
+        f"Dosage: {m.get('dosage', {})}\n"
+        f"Composition: {', '.join(m.get('composition', []))}\n"
+        f"Classe therapeutique: {m.get('therapeutic_class', 'Non disponible')}\n"
+        f"Statut: {m.get('status', 'Non disponible')}\n"
+        f"Prix: {m.get('price', {}).get('ppv', 'N/A')} MAD\n"
+        f"Indications: {', '.join(m.get('indications', [])) if m.get('indications') else 'Non specifie'}"
     )
 
 # ==========================================================
-# INITIALISATION LLMs + EMBEDDINGS
+# INITIALISATION LLMs
 # ==========================================================
 
+print("Initialisation LLM (LlamaIndex)...")
 Settings.llm = Ollama(model=MODEL_NAME, request_timeout=120)
+
+# ==========================================================
+# EMBEDDING — téléchargement unique + cache local
+# ==========================================================
 
 if os.path.exists(EMBEDDING_DIR) and os.listdir(EMBEDDING_DIR):
     print("Embedding trouvé en cache - chargement local...")
-    Settings.embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_DIR)
 else:
-    print("Téléchargement embedding (une seule fois)...")
+    print(f"Téléchargement embedding '{MODEL_EMBEDDING}' (une seule fois)...")
     SentenceTransformer(MODEL_EMBEDDING).save(EMBEDDING_DIR)
-    Settings.embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_DIR)
     print(f"Embedding sauvegardé dans '{EMBEDDING_DIR}'")
 
+Settings.embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_DIR)
+
 # ==========================================================
-# PIPELINE RAG — INGESTION JSONL (LlamaIndex)
+# CHARGEMENT DONNÉES JSONL
 # ==========================================================
 
 print("Chargement données privées (JSONL)...")
 data = load_data()
+print(f"{len(data)} médicaments chargés.")
+
+# ==========================================================
+# INDEX RAG — LlamaIndex (cache persistant)
+# ==========================================================
 
 if os.path.exists(INDEX_DIR) and os.listdir(INDEX_DIR):
     print("Index RAG trouvé en cache - chargement rapide...")
@@ -132,73 +133,112 @@ else:
 
 rag_query_engine = index.as_query_engine(similarity_top_k=3, response_mode="compact")
 
-# LLM LangChain partagé
+# LLM LangChain
 llm = OllamaLLM(model=MODEL_NAME, timeout=120)
 
 # ==========================================================
-# DÉTECTEUR D'INTENTION
+# MOTEUR VECTORIEL SYMPTÔME
+# ==========================================================
+
+print("Vectorisation des indications (modèle multilingue)...")
+symptom_model = SentenceTransformer(EMBEDDING_DIR)
+med_index = []
+
+for med in data:
+    indications = med.get("indications", [])
+    if not indications:
+        continue
+    indication_text = " ".join(indications)
+    vec = symptom_model.encode(indication_text, normalize_embeddings=True)
+    med_index.append((med, vec))
+
+print(f"{len(med_index)} médicaments indexés par indication.")
+
+
+def search_by_symptom(query: str, top_k: int = 3, threshold: float = SIMILARITY_THRESHOLD) -> list:
+    """
+    Recherche vectorielle cosinus entre la requête et les indications JSONL.
+    Retourne une liste de (med, score) triée par score décroissant.
+    Aucun dictionnaire statique — tout vient du JSONL.
+    """
+    q_vec = symptom_model.encode(
+        query, 
+        normalize_embeddings=True
+    ).reshape(1, -1)
+
+    scores = [
+        (med, float(cosine_similarity(q_vec, vec.reshape(1, -1))[0][0]))
+        for med, vec in med_index
+    ]
+    scores.sort(key=lambda x: x[1], reverse=True) # Tri par score décroissant
+    return [(med, sc) for med, sc in scores if sc >= threshold][:top_k]
+
+
+def format_symptom_result(results: list) -> str:
+    """
+    Formate les résultats de search_by_symptom en texte structuré
+    pour les agents suivants (RAG, sécurité, rédacteur).
+    """
+    if not results:
+        return ""
+
+    best_med, best_score = results[0]
+    lines = [
+        f"Médicament recommandé (similarité={best_score:.2f}) :",
+        f"Nom         : {best_med['drug_name']}",
+        f"Composition : {', '.join(best_med.get('composition', []))}",
+        f"Classe      : {best_med.get('therapeutic_class', 'N/A')}",
+        f"Prix PPV    : {best_med.get('price', {}).get('ppv', 'N/A')} MAD",
+        f"Indication  : {best_med['indications'][0]}",
+    ]
+
+    if len(results) > 1:
+        lines.append("\nAlternatives :")
+        for med, sc in results[1:]:
+            lines.append(f"  - {med['drug_name']} (score={sc:.2f})")
+
+    return "\n".join(lines)
+
+# ==========================================================
+# DÉTECTEUR D'INTENTION — version unique, vectorielle
 # ==========================================================
 
 def detect_intent(query: str) -> str:
     q      = normalize_text(query)
     tokens = set(q.split())
+
     if len(q) < 3:
         return "trop_court"
+
     if q in SALUTATIONS or tokens & SALUTATIONS:
         return "salutation"
+
     if q in REMERCIEMENTS or tokens & REMERCIEMENTS:
         return "remerciement"
-    for symptom in SYMPTOM_MAP:
-        if fuzz.token_set_ratio(q, normalize_text(symptom)) >= 80:
-            return "symptome"
+
     for med in data:
-        name = normalize_text(med["drug_name"])
-        scores = [fuzz.partial_ratio(q, name), fuzz.token_set_ratio(q, name)]
-        scores += [fuzz.partial_ratio(token, name) for token in tokens]
+        name   = normalize_text(med["drug_name"])
+        scores = [
+            fuzz.partial_ratio(q, name),
+            fuzz.token_set_ratio(q, name),
+        ] + [fuzz.partial_ratio(t, name) for t in tokens]
         if max(scores) >= 82:
             return "medicament"
+        
+    if search_by_symptom(query, top_k=1, threshold=SIMILARITY_THRESHOLD):
+        return "symptome"
+
     return "inconnu"
 
 # ==========================================================
-# OUTILS LANGCHAIN — un outil dédié par agent
+# OUTILS AGENTS 2 et 3
 # ==========================================================
-
-@tool
-def outil_detection_symptome(texte: str) -> str:
-    """
-    [Agent 1] Détecte le symptôme principal dans le texte utilisateur
-    et recommande un médicament depuis la base privée JSONL via matching fuzzy.
-    """
-    q = normalize_text(texte)
-    best, best_score = None, 0
-
-    for symptom in SYMPTOM_MAP:
-        score = fuzz.token_set_ratio(q, normalize_text(symptom))
-        if score > best_score:
-            best_score = score
-            best = symptom
-
-    if best_score >= 80:
-        molecules = SYMPTOM_MAP[best]
-        for mol in molecules:
-            for med in data:
-                compo = [normalize_text(c) for c in med.get("composition", [])]
-                if normalize_text(mol) in compo:
-                    return (
-                        f"Symptôme détecté : {best}\n"
-                        f"Médicament recommandé : {med['drug_name']}\n"
-                        f"Composition : {', '.join(med.get('composition', []))}"
-                    )
-        return f"Symptôme détecté : {best}. Molécules recommandées : {', '.join(molecules)}."
-
-    return "Aucun symptôme reconnu dans le texte."
-
 
 @tool
 def outil_recherche_rag(requete: str) -> str:
     """
     [Agent 2] Recherche sémantique dans la base privée via LlamaIndex RAG.
-    Embeddings all-MiniLM-L6-v2, retrieval top-k=3.
+    Embeddings multilingues, retrieval top-k=3.
     """
     result = rag_query_engine.query(requete)
     return str(result) if result else "Aucun médicament pertinent trouvé dans la base RAG."
@@ -207,8 +247,7 @@ def outil_recherche_rag(requete: str) -> str:
 @tool
 def outil_securite(contexte: str) -> str:
     """
-    [Agent 3] Vérifie si le contexte contient des termes sensibles.
-    Termes surveillés : INJECTABLE, VACCIN, PERFUSION.
+    [Agent 3] Détecte les termes sensibles : INJECTABLE, VACCIN, PERFUSION.
     """
     txt = contexte.lower()
     for term in BANNED_TERMS:
@@ -220,7 +259,7 @@ def outil_securite(contexte: str) -> str:
     return "Aucune alerte de sécurité détectée."
 
 # ==========================================================
-# TEMPLATE ReAct PARTAGÉ
+# TEMPLATE ReAct — partagé par Agents 2 et 3
 # ==========================================================
 
 REACT_TEMPLATE = """
@@ -247,17 +286,8 @@ Question: {input}
 
 REACT_PROMPT = PromptTemplate.from_template(REACT_TEMPLATE)
 
-# ==========================================================
-# FACTORY D'AGENTS ReAct
-# ==========================================================
 
 def make_agent(role: str, tools: list, max_iter: int = 5) -> AgentExecutor:
-    """
-    Crée un agent ReAct LangChain avec :
-    - un rôle défini (persona / system prompt)
-    - des outils dédiés à sa mission
-    - une capacité de raisonnement chain-of-thought (ReAct)
-    """
     prompt = REACT_PROMPT.partial(role=role)
     agent  = create_react_agent(llm, tools, prompt)
     return AgentExecutor(
@@ -269,24 +299,6 @@ def make_agent(role: str, tools: list, max_iter: int = 5) -> AgentExecutor:
         return_intermediate_steps=False,
     )
 
-# ==========================================================
-# AGENT 1 — SYMPTÔMES (ReAct)
-# ==========================================================
-
-def create_agent_symptomes() -> AgentExecutor:
-    return make_agent(
-        role=(
-            "un agent spécialiste en détection de symptômes pharmaceutiques. "
-            "Ta mission : identifier le symptôme principal dans la question "
-            "et trouver le médicament correspondant dans la base privée JSONL. "
-            "Utilise outil_detection_symptome pour effectuer cette recherche."
-        ),
-        tools=[outil_detection_symptome],
-    )
-
-# ==========================================================
-# AGENT 2 — RECHERCHE RAG (ReAct)
-# ==========================================================
 
 def create_agent_rag() -> AgentExecutor:
     return make_agent(
@@ -299,23 +311,20 @@ def create_agent_rag() -> AgentExecutor:
         tools=[outil_recherche_rag],
     )
 
-# ==========================================================
-# AGENT 3 — SÉCURITÉ (ReAct)
-# ==========================================================
 
 def create_agent_securite() -> AgentExecutor:
     return make_agent(
         role=(
             "un agent pharmacovigilance chargé de la sécurité des prescriptions. "
-            "Ta mission : analyser le contexte RAG et détecter "
+            "Ta mission : analyser le contexte et détecter "
             "tout terme sensible (INJECTABLE, VACCIN, PERFUSION). "
-            "Utilise outil_securite en lui passant le contexte RAG disponible."
+            "Utilise outil_securite en lui passant le contexte disponible."
         ),
         tools=[outil_securite],
     )
 
 # ==========================================================
-# AGENT 4 — RÉDACTEUR FINAL (LangChain Chain)
+# AGENT 4 — RÉDACTEUR FINAL (LangChain Chain simple)
 # ==========================================================
 
 WRITER_PROMPT = PromptTemplate.from_template("""
@@ -329,17 +338,18 @@ DONNÉES MÉDICAMENT   : {context}
 RAPPORT SÉCURITÉ     : {safety}
 ===============================================
 
-INSTRUCTIONS :
-- Réponds UNIQUEMENT sur la base des données fournies ci-dessus (base privée RAG).
+INSTRUCTIONS STRICTES :
+- Réponds UNIQUEMENT sur la base des données fournies ci-dessus.
 - Si DONNÉES MÉDICAMENT contient un médicament : cite son nom exact, sa posologie et ses indications.
-- Si SYMPTÔME est renseigné et un médicament est trouvé : lie-les explicitement.
-- Si danger détecté dans RAPPORT SÉCURITÉ : recommande impérativement de consulter un médecin.
+- Si SYMPTÔME est renseigné : lie explicitement le symptôme au médicament trouvé.
+- Si RAPPORT SÉCURITÉ contient une alerte : recommande impérativement de consulter un médecin.
 - Réponse courte (3-4 phrases max), professionnelle, en français.
 - Ne jamais inventer un médicament absent des données.
-- Si aucune information pertinente : dis-le clairement et oriente vers un pharmacien.
+- Si aucune information pertinente n'est disponible : dis-le clairement et oriente vers un pharmacien.
 
 RÉPONSE :
 """)
+
 
 def agent_writer(question: str, symptom: str, context: str, safety: str) -> str:
     chain = WRITER_PROMPT | llm
@@ -355,12 +365,6 @@ def agent_writer(question: str, symptom: str, context: str, safety: str) -> str:
 # ==========================================================
 
 def orchestrator(query: str) -> str:
-    """
-    Orchestrateur principal :
-    1. Détecte l'intention → routage conditionnel
-    2. Pipeline séquentiel : Agent1 → Agent2 → Agent3 → Agent4
-    3. L'état est transmis via des variables locales entre étapes
-    """
     intent = detect_intent(query)
 
     if intent == "trop_court":
@@ -382,13 +386,13 @@ def orchestrator(query: str) -> str:
             "Posez-moi une question sur un médicament ou décrivez vos symptômes."
         )
 
-    print("\nAgent 1 : détection symptôme...")
+    print("\nAgent 1 : recherche vectorielle symptôme...")
     symptom = ""
     try:
-        result1 = create_agent_symptomes().invoke({"input": query})
-        symptom = result1.get("output", "")
+        results = search_by_symptom(query, top_k=3, threshold=SIMILARITY_THRESHOLD)
+        symptom = format_symptom_result(results)
     except Exception as e:
-        print(f" Agent 1 erreur : {e}")
+        print(f"  Agent 1 erreur : {e}")
 
     print("\nAgent 2 : recherche RAG...")
     context = ""
@@ -397,7 +401,8 @@ def orchestrator(query: str) -> str:
         result2   = create_agent_rag().invoke({"input": rag_input})
         context   = result2.get("output", "")
     except Exception as e:
-        print(f"Agent 2 erreur : {e}")
+        print(f"  Agent 2 erreur : {e}")
+        context = symptom
 
     if not symptom and not context:
         return (
@@ -408,14 +413,14 @@ def orchestrator(query: str) -> str:
     print("\nAgent 3 : vérification sécurité...")
     safety = "Vérification sécurité indisponible."
     try:
-        result3 = create_agent_securite().invoke({"input": context or query})
+        result3 = create_agent_securite().invoke({"input": context or symptom or query})
         safety  = result3.get("output", safety)
     except Exception as e:
-        print(f"Agent 3 erreur : {e}")
+        print(f"  Agent 3 erreur : {e}")
 
     print("\nAgent 4 : rédaction finale...")
     response = agent_writer(query, symptom, context, safety)
-    print("Réponse rédigée.")
+    print("  Réponse rédigée.")
 
     return response
 
